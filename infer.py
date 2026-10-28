@@ -9,7 +9,9 @@ Two input modes are supported:
 import argparse
 import base64
 import json
+import math
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -20,7 +22,7 @@ import requests
 
 SERVED_MODEL_NAME = "Unlimited-OCR"
 SERVER_URL = "http://127.0.0.1:10000"
-HOST = "0.0.0.0"
+HOST = "127.0.0.1"
 PORT = 10000
 SERVER_TIMEOUT = 300
 PDF_DPI = 300
@@ -30,35 +32,40 @@ MEM_FRACTION_STATIC = 0.8
 PROMPT = "document parsing."
 TEMPERATURE = 0
 CONTEXT_LENGTH = 32768
-NO_REPEAT_NGRAM_SIZE = 35
-NGRAM_WINDOW = 128
 REQUEST_TIMEOUT = 1200
 MAX_RETRIES = 5
-NO_REPEAT_NGRAM_PROCESSOR_STR = None
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_PDF_PAGES = 100
+MAX_PDF_PAGE_PIXELS = 20_000_000
+MAX_PDF_TOTAL_PIXELS = 100_000_000
+MAX_CONCURRENCY = 8
 
 
-def get_ngram_processor_str():
-    global NO_REPEAT_NGRAM_PROCESSOR_STR
-    if NO_REPEAT_NGRAM_PROCESSOR_STR is None:
-        from sglang.srt.sampling.custom_logit_processor import (
-            DeepseekOCRNoRepeatNGramLogitProcessor,
-        )
-        NO_REPEAT_NGRAM_PROCESSOR_STR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
-    return NO_REPEAT_NGRAM_PROCESSOR_STR
-
-
-def pdf_to_images(pdf_path: str, dpi: int = 300) -> list[str]:
+def pdf_to_images(pdf_path: str, output_dir: str, dpi: int = 300) -> list[str]:
     import fitz
 
     doc = fitz.open(pdf_path)
-    tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
     image_paths = []
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    for i, page in enumerate(doc):
-        out_path = os.path.join(tmp_dir, f"page_{i + 1:04d}.png")
-        page.get_pixmap(matrix=mat).save(out_path)
-        image_paths.append(out_path)
-    doc.close()
+    try:
+        if len(doc) > MAX_PDF_PAGES:
+            raise ValueError(f"PDF exceeds the {MAX_PDF_PAGES}-page limit")
+        scale = dpi / 72
+        mat = fitz.Matrix(scale, scale)
+        total_pixels = 0
+        for i, page in enumerate(doc):
+            width = math.ceil(page.rect.width * scale)
+            height = math.ceil(page.rect.height * scale)
+            page_pixels = width * height
+            if width <= 0 or height <= 0 or page_pixels > MAX_PDF_PAGE_PIXELS:
+                raise ValueError(f"PDF page {i + 1} exceeds the pixel limit")
+            total_pixels += page_pixels
+            if total_pixels > MAX_PDF_TOTAL_PIXELS:
+                raise ValueError("PDF exceeds the total pixel limit")
+            out_path = os.path.join(output_dir, f"page_{i + 1:04d}.png")
+            page.get_pixmap(matrix=mat).save(out_path)
+            image_paths.append(out_path)
+    finally:
+        doc.close()
     return image_paths
 
 
@@ -66,7 +73,10 @@ def encode_image(image_path: str) -> dict:
     ext = os.path.splitext(image_path)[1].lower()
     mime = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
     with open(image_path, "rb") as f:
-        data = base64.b64encode(f.read()).decode("utf-8")
+        image = f.read(MAX_IMAGE_BYTES + 1)
+    if len(image) > MAX_IMAGE_BYTES:
+        raise ValueError(f"Image exceeds the {MAX_IMAGE_BYTES}-byte limit")
+    data = base64.b64encode(image).decode("utf-8")
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
 
 
@@ -74,22 +84,29 @@ def build_content(image_path: str) -> list[dict]:
     return [{"type": "text", "text": PROMPT}, encode_image(image_path)]
 
 
-def server_ready(server_url: str) -> bool:
+def server_ready(server_url: str, api_key: str) -> bool:
+    session = requests.Session()
+    session.trust_env = False
     try:
-        resp = requests.get(f"{server_url}/health", timeout=5)
-        return resp.status_code == 200
-    except requests.RequestException:
+        resp = session.get(
+            f"{server_url}/v1/models",
+            headers={"Authorization": "Bearer " + api_key},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return False
+        return any(model.get("id") == SERVED_MODEL_NAME for model in resp.json().get("data", []))
+    except (requests.RequestException, ValueError, AttributeError):
         return False
+    finally:
+        session.close()
 
 
 def start_server(args):
-    if server_ready(SERVER_URL):
-        print(f"Reuse existing SGLang server: {SERVER_URL}")
-        return None
-
     os.makedirs(os.path.dirname(os.path.abspath(args.server_log)) or ".", exist_ok=True)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
+    args.api_key = secrets.token_urlsafe(32)
 
     cmd = [
         sys.executable,
@@ -107,9 +124,10 @@ def start_server(args):
         str(MEM_FRACTION_STATIC),
         "--context-length",
         str(CONTEXT_LENGTH),
-        "--enable-custom-logit-processor",
         "--disable-overlap-schedule",
         "--skip-server-warmup",
+        "--api-key",
+        args.api_key,
         "--host",
         HOST,
         "--port",
@@ -127,7 +145,7 @@ def start_server(args):
         if process.poll() is not None:
             log_file.flush()
             raise RuntimeError(f"SGLang server exited early. Check {args.server_log}")
-        if server_ready(SERVER_URL):
+        if server_ready(SERVER_URL, args.api_key):
             print(f"Server ready ({time.time() - start:.0f}s)")
             return process
         time.sleep(3)
@@ -186,45 +204,53 @@ def collect_stream_silent(resp, output_file: str | None) -> dict:
 
 
 def infer_one(image_path: str, output_file: str | None, args, idx: int) -> dict:
+    name = ascii(os.path.basename(image_path))
+    try:
+        content = build_content(image_path)
+    except Exception as e:
+        print(f"  [{idx}] {name}: FAILED ({ascii(str(e))})")
+        return {"tokens": 0, "decode_time": 0, "text": ""}
+
     payload = {
         "model": SERVED_MODEL_NAME,
-        "messages": [{"role": "user", "content": build_content(image_path)}],
+        "messages": [{"role": "user", "content": content}],
         "temperature": TEMPERATURE,
         "skip_special_tokens": False,
         "stream": True,
         "images_config": {"image_mode": args.image_mode},
     }
-    if NO_REPEAT_NGRAM_SIZE > 0 and NGRAM_WINDOW > 0:
-        payload["custom_logit_processor"] = get_ngram_processor_str()
-        payload["custom_params"] = {
-            "ngram_size": NO_REPEAT_NGRAM_SIZE,
-            "window_size": NGRAM_WINDOW,
-        }
 
-    name = os.path.basename(image_path)
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.post(
-                f"{SERVER_URL}/v1/chat/completions",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=REQUEST_TIMEOUT,
-                stream=True,
-            )
-            if resp.status_code == 502 and attempt < MAX_RETRIES - 1:
-                time.sleep(3 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            result = collect_stream_silent(resp, output_file)
-            print(f"  [{idx}] {name}: {result['tokens']} tokens, {result['decode_time']:.1f}s")
-            return result
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                print(f"  [{idx}] {name}: retry {attempt + 1}/{MAX_RETRIES} ({e})")
-                time.sleep(3 * (attempt + 1))
-                continue
-            print(f"  [{idx}] {name}: FAILED ({e})")
-            return {"tokens": 0, "decode_time": 0, "text": ""}
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = session.post(
+                    f"{SERVER_URL}/v1/chat/completions",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + args.api_key,
+                    },
+                    data=json.dumps(payload),
+                    timeout=REQUEST_TIMEOUT,
+                    stream=True,
+                )
+                if resp.status_code == 502 and attempt < MAX_RETRIES - 1:
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                result = collect_stream_silent(resp, output_file)
+                print(f"  [{idx}] {name}: {result['tokens']} tokens, {result['decode_time']:.1f}s")
+                return result
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"  [{idx}] {name}: retry {attempt + 1}/{MAX_RETRIES} ({ascii(str(e))})")
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                print(f"  [{idx}] {name}: FAILED ({ascii(str(e))})")
+                return {"tokens": 0, "decode_time": 0, "text": ""}
+    finally:
+        session.close()
 
 
 def collect_dataset_images(image_dir: str) -> list[str]:
@@ -237,9 +263,9 @@ def collect_dataset_images(image_dir: str) -> list[str]:
     return sorted(image_files, key=lambda f: os.path.getsize(f), reverse=True)
 
 
-def build_jobs(args) -> list[tuple[str, str | None]]:
+def build_jobs(args, temp_dir: str | None = None) -> list[tuple[str, str | None]]:
     if args.pdf:
-        image_files = pdf_to_images(args.pdf, dpi=PDF_DPI)
+        image_files = pdf_to_images(args.pdf, temp_dir, dpi=PDF_DPI)
         prefix = os.path.splitext(os.path.basename(args.pdf))[0]
         jobs = []
         for i, image_path in enumerate(image_files):
@@ -265,39 +291,45 @@ def build_jobs(args) -> list[tuple[str, str | None]]:
 
 
 def run(args):
-    jobs = build_jobs(args)
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
+    temp_dir = tempfile.TemporaryDirectory(prefix="pdf_ocr_") if args.pdf else None
+    try:
+        jobs = build_jobs(args, temp_dir.name if temp_dir else None)
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
 
-    mode = "pdf_pages" if args.pdf else "dataset_images"
-    print(f"Mode: {mode}, requests={len(jobs)}, concurrency={args.concurrency}, image_mode={args.image_mode}")
+        mode = "pdf_pages" if args.pdf else "dataset_images"
+        concurrency = min(args.concurrency, MAX_CONCURRENCY)
+        print(f"Mode: {mode}, requests={len(jobs)}, concurrency={concurrency}, image_mode={args.image_mode}")
 
-    wall_start = time.time()
-    results = []
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = {
-            executor.submit(infer_one, image_path, output_file, args, i + 1): image_path
-            for i, (image_path, output_file) in enumerate(jobs)
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+        wall_start = time.time()
+        results = []
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(infer_one, image_path, output_file, args, i + 1): image_path
+                for i, (image_path, output_file) in enumerate(jobs)
+            }
+            for future in as_completed(futures):
+                results.append(future.result())
 
-    wall_time = time.time() - wall_start
-    total_tokens = sum(r["tokens"] for r in results)
-    successful = sum(1 for r in results if r["tokens"] > 0)
-    print(f"\n{'=' * 60}")
-    print("Concurrent Results:")
-    print(f"  Requests: {successful}/{len(jobs)}")
-    print(f"  Total tokens: {total_tokens}")
-    print(f"  Wall time: {wall_time:.2f}s")
-    if wall_time > 0:
-        print(f"  System TPS: {total_tokens / wall_time:.2f} tokens/s")
-    if successful > 0:
-        avg_decode = sum(r["decode_time"] for r in results if r["tokens"] > 0) / successful
-        avg_tokens = total_tokens / successful
-        print(f"  Avg tokens/request: {avg_tokens:.0f}")
-        print(f"  Avg decode_time/request: {avg_decode:.2f}s")
-    print(f"{'=' * 60}")
+        wall_time = time.time() - wall_start
+        total_tokens = sum(r["tokens"] for r in results)
+        successful = sum(1 for r in results if r["tokens"] > 0)
+        print(f"\n{'=' * 60}")
+        print("Concurrent Results:")
+        print(f"  Requests: {successful}/{len(jobs)}")
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Wall time: {wall_time:.2f}s")
+        if wall_time > 0:
+            print(f"  System TPS: {total_tokens / wall_time:.2f} tokens/s")
+        if successful > 0:
+            avg_decode = sum(r["decode_time"] for r in results if r["tokens"] > 0) / successful
+            avg_tokens = total_tokens / successful
+            print(f"  Avg tokens/request: {avg_tokens:.0f}")
+            print(f"  Avg decode_time/request: {avg_decode:.2f}s")
+        print(f"{'=' * 60}")
+    finally:
+        if temp_dir:
+            temp_dir.cleanup()
 
 
 def parse_args():
@@ -308,7 +340,7 @@ def parse_args():
     parser.add_argument("--image_dir", default="", help="Directory of images for dataset concurrency mode")
     parser.add_argument("--pdf", default="", help="PDF file; each page is converted and sent as one concurrent request")
     parser.add_argument("--output_dir", default="./outputs")
-    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--concurrency", type=int, default=8, help="Maximum concurrent requests (capped at 8)")
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--model_dir", default="baidu/Unlimited-OCR")
     parser.add_argument("--image_mode", choices=("gundam", "base"), default="gundam")
