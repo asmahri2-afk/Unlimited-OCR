@@ -64,10 +64,14 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 model_name = 'baidu/Unlimited-OCR'
+model_revision = '<audited model repository commit SHA>'
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name, revision=model_revision, trust_remote_code=True
+)
 model = AutoModel.from_pretrained(
     model_name,
+    revision=model_revision,
     trust_remote_code=True,
     use_safetensors=True,
     torch_dtype=torch.bfloat16,
@@ -127,6 +131,10 @@ model.infer_multi(
 )
 ```
 
+`trust_remote_code=True` executes Python code from the model repository. Review
+that code before use and replace `model_revision` with the immutable commit SHA
+you reviewed; do not use a moving branch or tag.
+
 ### vLLM
 
 Please refer to the official vLLM recipe for deployment details:
@@ -160,6 +168,7 @@ uv pip install pymupdf==1.27.2.2
 
 Start the SGLang server:
 ```shell
+export SGLANG_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 python -m sglang.launch_server \
     --model baidu/Unlimited-OCR \
     --served-model-name Unlimited-OCR \
@@ -167,10 +176,10 @@ python -m sglang.launch_server \
     --page-size 1 \
     --mem-fraction-static 0.8 \
     --context-length 32768 \
-    --enable-custom-logit-processor \
     --disable-overlap-schedule \
     --skip-server-warmup \
-    --host 0.0.0.0 \
+    --api-key "$SGLANG_API_KEY" \
+    --host 127.0.0.1 \
     --port 10000
 ```
 
@@ -183,9 +192,9 @@ import tempfile
 
 import fitz
 import requests
-from sglang.srt.sampling.custom_logit_processor import DeepseekOCRNoRepeatNGramLogitProcessor
 
 server_url = "http://127.0.0.1:10000"
+api_key = os.environ["SGLANG_API_KEY"]
 
 session = requests.Session()
 session.trust_env = False
@@ -216,23 +225,21 @@ def build_content(prompt, image_paths):
     return [{"type": "text", "text": prompt}] + [encode_image(path) for path in image_paths]
 
 
-def generate(prompt, image_paths, image_mode, ngram_window):
+def generate(prompt, image_paths, image_mode):
     payload = {
         "model": "Unlimited-OCR",
         "messages": [{"role": "user", "content": build_content(prompt, image_paths)}],
         "temperature": 0,
         "skip_special_tokens": False,
         "images_config": {"image_mode": image_mode},
-        "custom_logit_processor": DeepseekOCRNoRepeatNGramLogitProcessor.to_str(),
-        "custom_params": {
-            "ngram_size": 35,
-            "window_size": ngram_window,
-        },
         "stream": True,
     }
     response = session.post(
         f"{server_url}/v1/chat/completions",
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + api_key,
+        },
         data=json.dumps(payload),
         timeout=1200,
         stream=True,
@@ -256,13 +263,13 @@ def generate(prompt, image_paths, image_mode, ngram_window):
 
 
 # Single image supports two configs: gundam or base. Example below uses gundam.
-generate("document parsing.", ["your_image.jpg"], image_mode="gundam", ngram_window=128)
+generate("document parsing.", ["your_image.jpg"], image_mode="gundam")
 
 # Multi image (base only)
-generate("Multi page parsing.", ["page1.png", "page2.png"], image_mode="base", ngram_window=1024)
+generate("Multi page parsing.", ["page1.png", "page2.png"], image_mode="base")
 
 # PDF (base only)
-generate("Multi page parsing.", pdf_to_images("your_doc.pdf", dpi=300), image_mode="base", ngram_window=1024)
+generate("Multi page parsing.", pdf_to_images("your_doc.pdf", dpi=300), image_mode="base")
 ```
 
 For batch inference, `infer.py` starts the SGLang server automatically and sends concurrent requests for an image directory or PDF:
